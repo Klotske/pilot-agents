@@ -1,20 +1,20 @@
-[project]
-name = "pilot-agents"
-version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-authors = [
-    { name = "Klotske", email = "ilya@mokhov.vg" }
+[dependency-groups]
+dev = [
+    "pyright>=1.1.414,<2",
 ]
-requires-python = ">=3.12"
-dependencies = []
-
-[build-system]
-requires = ["uv_build>=0.13.8,<0.14.0"]
-build-backend = "uv_build"
 
 [tool.uv.workspace]
 members = [
     "packages/*",
-    "apps/*"
+    "apps/*",
 ]
+
+[tool.pyright]
+include = [
+    "packages/review-agent-core/src",
+    "apps/review-agent-cli/src",
+]
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "strict"
+pythonVersion = "3.12"
