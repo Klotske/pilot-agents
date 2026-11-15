@@ -1,14 +1,22 @@
 [project]
 name = "review-agent-core"
 version = "0.1.0"
-description = "Add your description here"
+description = "CrewAI review agent core over a local git repository"
 readme = "README.md"
 authors = [
     { name = "Klotske", email = "ilya@mokhov.vg" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "crewai>=1.15,<2",
+    "rich>=13",
+]
 
 [build-system]
 requires = ["uv_build>=0.13.8,<0.14.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<9",
+]
