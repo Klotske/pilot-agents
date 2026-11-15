@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from . import models
+from ._generated import UpsourceRpcMethods
 from .errors import UpsourceError, UpsourceTransportError, build_error
 
 _RETRYABLE_HTTP_STATUS = frozenset({429, 500, 502, 503, 504})
@@ -22,16 +22,19 @@ class _RetryableError(Exception):
         self.cause = cause
 
 
-class UpsourceClient:
+class UpsourceClient(UpsourceRpcMethods):
     """A lightweight client for the Upsource RPC API.
+
+    The typed RPC methods (one per Upsource API method, in snake_case) are
+    generated into :class:`UpsourceRpcMethods` and mixed in here.
 
     Args:
         base_url: Upsource server root, e.g. ``https://review.example.com``
             (the ``/~rpc`` prefix is added automatically).
         login: Optional Basic-auth login. When omitted, requests run as guest.
         password: Optional Basic-auth password.
-        project_id: Default project used by the high-level helpers; can be
-            overridden per call.
+        project_id: Default project used by the generated methods; can be
+            overridden per call via ``project_id=``.
         timeout: Per-request timeout in seconds.
         max_retries: Extra attempts for idempotent GET requests on transient
             failures (transport errors, 429/5xx).
@@ -135,83 +138,3 @@ class UpsourceClient:
                 "project_id must be provided either at construction or per call"
             )
         return pid
-
-    def _review_id(self, review_id: str, project_id: str | None) -> models.ReviewIdDTO:
-        return {"projectId": self._project(project_id), "reviewId": review_id}
-
-    # ----------------------------------------------------------- high-level API
-
-    def get_review(
-        self, review_id: str, project_id: str | None = None
-    ) -> models.ReviewDescriptorDTO:
-        """Return review details (title, state, participants, labels, ...)."""
-        return self.call("getReviewDetails", {"reviewId": self._review_id(review_id, project_id)})
-
-    def get_review_diff(
-        self, review_id: str, project_id: str | None = None
-    ) -> models.ReviewSummaryChangesResponseDTO:
-        """Return the summary diff (sum of all revisions) of a review."""
-        return self.call(
-            "getReviewSummaryChanges", {"reviewId": self._review_id(review_id, project_id)}
-        )
-
-    def get_review_comments(
-        self, review_id: str, project_id: str | None = None
-    ) -> list[models.CommentDTO]:
-        """Return a flat list of comments across all discussions in a review."""
-        data = self.call(
-            "getReviewSummaryDiscussions", {"reviewId": self._review_id(review_id, project_id)}
-        )
-        comments: list[models.CommentDTO] = []
-        for item in data.get("discussions", []) or []:
-            discussion = item.get("discussionInFile") or {}
-            comments.extend(discussion.get("comments", []) or [])
-        return comments
-
-    def read_repository_file(
-        self, path: str, revision: str, project_id: str | None = None
-    ) -> str:
-        """Return the text content of ``path`` at ``revision``.
-
-        Raises :class:`UpsourceError` when no text is returned (e.g. the file is
-        binary or too large to display).
-        """
-        request: models.FileInRevisionDTO = {
-            "projectId": self._project(project_id),
-            "revisionId": revision,
-            "fileName": path,
-        }
-        data = self.call("getFileContent", request)
-        content = data.get("fileContent") or {}
-        text = content.get("text")
-        if text is None:
-            raise UpsourceError(f"no text content returned for {path!r} at {revision!r}")
-        return text
-
-    def get_coverage_report(
-        self, revision: str, project_id: str | None = None
-    ) -> list[models.ShortReviewInfoDTO]:
-        """Return reviews that cover the given revision."""
-        request: models.RevisionListDTO = {
-            "projectId": self._project(project_id),
-            "revisionId": [revision],
-        }
-        data = self.call("getRevisionReviewInfo", request)
-        result: list[models.ShortReviewInfoDTO] = []
-        for item in data.get("reviewInfo", []) or []:
-            info = item.get("reviewInfo")
-            if info:
-                result.append(info)
-        return result
-
-    def publish_review_comment(
-        self, review_id: str, comment: str, project_id: str | None = None
-    ) -> models.DiscussionInFileDTO:
-        """Post a top-level comment (a new discussion) on a review."""
-        request: models.CreateDiscussionRequestDTO = {
-            "projectId": self._project(project_id),
-            "reviewId": self._review_id(review_id, project_id),
-            "text": comment,
-            "anchor": {},
-        }
-        return self.call("createDiscussion", request)

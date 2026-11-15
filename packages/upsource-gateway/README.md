@@ -1,8 +1,9 @@
 # upsource-gateway
 
 A lightweight, synchronous client for the [Upsource](https://www.jetbrains.com/upsource/)
-RPC API. Ships full type coverage: 370 message DTOs as `TypedDict` and 33 enums as
-`StrEnum`/`IntEnum`, generated from the official API descriptor.
+RPC API. Ships full type coverage: 370 message DTOs as pydantic `BaseModel`, 33
+enums as `StrEnum`/`IntEnum`, and 175 typed RPC methods — all generated from the
+official API descriptor.
 
 ## Install
 
@@ -13,7 +14,7 @@ uv sync
 ## Quick start
 
 ```python
-from upsource_gateway import UpsourceClient, UpsourceError
+from upsource_gateway import UpsourceClient
 
 client = UpsourceClient(
     base_url="https://review-pilot.ascon.net",
@@ -22,15 +23,18 @@ client = UpsourceClient(
     project_id="demo-project",
 )
 
-review = client.get_review("CR-123")          # ReviewDescriptorDTO
-diff = client.get_review_diff("CR-123")       # ReviewSummaryChangesResponseDTO
-comments = client.get_review_comments("CR-123")  # list[CommentDTO]
-text = client.read_repository_file("/src/main.py", "abc123")  # str
-reviews = client.get_coverage_report("abc123")  # list[ShortReviewInfoDTO]
-discussion = client.publish_review_comment("CR-123", "LGTM")
+review = client.get_review_details(review_id="CR-123")   # ReviewDescriptorDTO
+diff = client.get_review_summary_changes(review_id="CR-123")  # ReviewSummaryChangesResponseDTO
+comments = client.get_review_summary_discussions(review_id="CR-123")  # DiscussionsInFilesDTO
+file = client.get_file_content(revision_id="abc123", file_name="/src/main.py")
+client.close_review(review_id="CR-123", is_flagged=True)  # CloseReviewResponseDTO
 ```
 
-All high-level methods accept an optional `project_id=` to override the client default.
+Generated methods are keyword-only, snake_case, and return typed pydantic models
+(`None` for methods with no return value). Methods whose request carries a
+top-level `projectId` accept an optional `project_id=` that overrides the client
+default; nested `ReviewIdDTO` arguments are built for you from a plain
+`review_id=` + the resolved project id.
 
 ## Raw RPC access
 
@@ -41,6 +45,17 @@ result = client.call("getReviews", {"projectId": "demo-project", "limit": 50, "q
 result = client.call("getReviews", {...}, use_get=True)
 ```
 
+## Validation
+
+- **Responses are parsed leniently**: unknown fields are ignored, unknown enum
+  values are kept as raw strings, scalar values are coerced.
+- **Requests are validated strictly**: missing required fields and wrong scalar
+  types raise `pydantic.ValidationError`.
+
+Read-only methods (detected by name: `get*`, `find*`, `query*`, ...) are sent as
+GET and retried (up to `max_retries=3`, exponential backoff) on transient
+failures; write methods are POST and never retried.
+
 ## Errors
 
 - `UpsourceRpcError` — structured `{"error": {"code", "message"}}` from Upsource,
@@ -49,18 +64,21 @@ result = client.call("getReviews", {...}, use_get=True)
 - `UpsourceTransportError` — network/timeout/HTTP-level failures.
 - Both derive from `UpsourceError`.
 
-Read-only GET calls are retried (up to `max_retries=3`, exponential backoff) on
-transient failures; POST calls are never retried.
+## Regenerating models & client
 
-## Regenerating models
-
-`src/upsource_gateway/models.py` is generated from `tools/api.json` (a snapshot of
-the Upsource API descriptor) and committed to the repo.
+`src/upsource_gateway/models.py` and `src/upsource_gateway/_generated.py` are
+generated from `tools/api.json` (a snapshot of the Upsource API descriptor) and
+committed to the repo.
 
 ```bash
-python tools/codegen.py                     # regenerate from tools/api.json
+python tools/codegen.py                     # regenerate both files
 python tools/codegen.py --input /path/to/fresh/api.json   # from a refreshed dump
 ```
+
+A couple of overrides live at the top of `tools/codegen.py` (rather than in the
+snapshot): `WRAPPED_ARGS` for the few methods that wrap their argument DTO under
+a named key, and `READ_ONLY_OVERRIDES` / `WRITE_OVERRIDES` to pin the HTTP verb
+of specific methods.
 
 ## Tests
 

@@ -1,4 +1,4 @@
-"""Tests for the codegen and the generated models module."""
+"""Tests for the codegen and the generated models/client modules."""
 
 from __future__ import annotations
 
@@ -46,32 +46,57 @@ def test_all_method_types_resolve() -> None:
                 ), f"{method['name']}.{kind} -> {t}"
 
 
-def test_generated_file_is_up_to_date() -> None:
+def test_generated_files_are_up_to_date() -> None:
     data = load_api()
-    rendered = codegen.render(data["messages"], data["enums"])
-    committed = (SRC / "upsource_gateway" / "models.py").read_text(encoding="utf-8")
-    assert rendered == committed, "models.py is stale; run tools/codegen.py"
+    models_rendered = codegen.render_models(data["messages"], data["enums"])
+    client_rendered = codegen.render_client(data, data["messages"], data["enums"])
+    committed_models = (SRC / "upsource_gateway" / "models.py").read_text(encoding="utf-8")
+    committed_client = (SRC / "upsource_gateway" / "_generated.py").read_text(encoding="utf-8")
+    assert models_rendered == committed_models, "models.py is stale; run tools/codegen.py"
+    assert client_rendered == committed_client, "_generated.py is stale; run tools/codegen.py"
 
 
-def test_key_dtos_shape() -> None:
-    review_hints = get_type_hints(models.ReviewIdDTO)
-    file_hints = get_type_hints(models.FileInRevisionDTO)
-    assert review_hints["projectId"] == str
-    assert review_hints["reviewId"] == str
-    assert file_hints["revisionId"] == str
-    assert file_hints["fileName"] == str
+def test_key_dto_shape() -> None:
+    review = models.ReviewIdDTO(projectId="p", reviewId="r")
+    assert review.projectId == "p"
+    assert review.reviewId == "r"
+    assert review.model_dump() == {"projectId": "p", "reviewId": "r"}
 
 
-def test_keyword_field_names_are_handled() -> None:
-    assert "from" in models.RangeMappingDTO.__annotations__
-    assert "from" in models.ReviewersGraphLinkDTO.__annotations__
+def test_keyword_field_names_use_aliases() -> None:
+    assert "from_" in models.RangeMappingDTO.__annotations__
+    assert "from_" in models.ReviewersGraphLinkDTO.__annotations__
+    assert models.RangeMappingDTO.model_fields["from_"].alias == "from"
     assert models.RevisionStateEnum.None_.value == "None"
 
 
 def test_cyclic_message_types_resolve() -> None:
     for name in (
-        "FileAnnotationResponseDTO",
         "FileAnnotationSectionDTO",
+        "FileAnnotationResponseDTO",
         "FileInlineDiffResponseDTO",
     ):
         get_type_hints(getattr(models, name))
+
+
+def test_enum_field_accepts_unknown_value_as_str() -> None:
+    m = models.CloseReviewResponseDTO.model_validate({"syncResult": "TotallyNew"})
+    assert m.syncResult == "TotallyNew"
+    assert isinstance(m.syncResult, str)
+
+
+def test_response_ignores_extra_fields() -> None:
+    m = models.UserAgreementTextDTO.model_validate({"text": "x", "extra": 1})
+    assert m.text == "x"
+    assert not hasattr(m, "extra")
+
+
+def test_request_is_strict() -> None:
+    from pydantic import ValidationError
+
+    try:
+        models.ReviewIdDTO.model_validate({"projectId": "p", "reviewId": 123}, strict=True)
+    except ValidationError:
+        pass
+    else:
+        raise AssertionError("strict validation should reject int for str field")

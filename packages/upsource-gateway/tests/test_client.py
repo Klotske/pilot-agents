@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from upsource_gateway import (
     AuthenticationError,
@@ -16,6 +17,7 @@ from upsource_gateway import (
     UpsourceError,
     UpsourceRpcError,
     UpsourceTransportError,
+    models,
 )
 
 BASE = "https://example.test"
@@ -43,6 +45,9 @@ def make_client(
 
 def json_body(request: httpx.Request) -> dict[str, Any]:
     return json.loads(request.content.decode("utf-8"))
+
+
+# ------------------------------------------------------------------ transport
 
 
 def test_post_url_and_auth_header() -> None:
@@ -137,127 +142,74 @@ def test_post_is_not_retried() -> None:
     assert attempts["n"] == 1
 
 
-def test_get_review() -> None:
-    captured: dict[str, Any] = {}
-    payload = {"reviewId": {"projectId": "demo", "reviewId": "CR-1"}, "title": "T"}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json_body(request)
-        return httpx.Response(200, json={"result": payload})
-
-    client = make_client(handler)
-    result = client.get_review("CR-1")
-
-    assert captured["body"] == {"reviewId": {"projectId": "demo", "reviewId": "CR-1"}}
-    assert result == payload
+# --------------------------------------------------------- generated methods
 
 
-def test_get_review_comments_flattens() -> None:
-    payload = {
-        "discussions": [
-            {
-                "fileName": "/a.py",
-                "discussionInFile": {
-                    "discussionId": "d1",
-                    "comments": [
-                        {"commentId": "c1", "text": "one"},
-                        {"commentId": "c2", "text": "two"},
-                    ],
-                },
-            },
-            {
-                "fileName": "/b.py",
-                "discussionInFile": {
-                    "discussionId": "d2",
-                    "comments": [{"commentId": "c3", "text": "three"}],
-                },
-            },
-        ]
-    }
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"result": payload})
-
-    client = make_client(handler)
-    comments = client.get_review_comments("CR-1")
-
-    assert [c["commentId"] for c in comments] == ["c1", "c2", "c3"]
-
-
-def test_read_repository_file() -> None:
+def test_get_review_details_wrapped_get() -> None:
     captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json_body(request)
+        captured["method"] = request.method
+        captured["params"] = json.loads(request.url.params.get("params"))
         return httpx.Response(
-            200, json={"result": {"fileContent": {"text": "print('hi')\n"}}}
+            200,
+            json={
+                "result": {
+                    "reviewId": {"projectId": "demo", "reviewId": "CR-1"},
+                    "title": "T",
+                    "participants": [],
+                    "state": "Open",
+                    "branch": [],
+                    "issue": [],
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "labels": [],
+                }
+            },
         )
 
     client = make_client(handler)
-    text = client.read_repository_file("/src/main.py", "abc123")
+    result = client.get_review_details(review_id="CR-1")
 
-    assert text == "print('hi')\n"
-    assert captured["body"] == {
-        "projectId": "demo",
-        "revisionId": "abc123",
-        "fileName": "/src/main.py",
-    }
-
-
-def test_read_repository_file_no_text_raises() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"result": {"contentType": {}}})
-
-    client = make_client(handler)
-    with pytest.raises(UpsourceError):
-        client.read_repository_file("/binary.bin", "abc123")
+    assert captured["method"] == "GET"
+    assert captured["params"] == {"reviewId": {"projectId": "demo", "reviewId": "CR-1"}}
+    assert isinstance(result, models.ReviewDescriptorDTO)
+    assert result.reviewId.reviewId == "CR-1"
+    assert result.state == models.ReviewStateEnum.Open
 
 
-def test_get_coverage_report() -> None:
-    payload = {
-        "reviewInfo": [
-            {"reviewInfo": {"reviewId": {"projectId": "demo", "reviewId": "CR-1"}}},
-            {"reviewInfo": None},
-            {"reviewInfo": {"reviewId": {"projectId": "demo", "reviewId": "CR-2"}}},
-        ]
-    }
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"result": payload})
-
-    client = make_client(handler)
-    reviews = client.get_coverage_report("abc123")
-
-    assert [r["reviewId"]["reviewId"] for r in reviews] == ["CR-1", "CR-2"]
-
-
-def test_publish_review_comment() -> None:
+def test_close_review_nested_review_id_post() -> None:
     captured: dict[str, Any] = {}
-    payload = {"discussionId": "d1"}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
         captured["body"] = json_body(request)
-        return httpx.Response(200, json={"result": payload})
+        return httpx.Response(200, json={"result": {}})
 
     client = make_client(handler)
-    result = client.publish_review_comment("CR-1", "LGTM")
+    result = client.close_review(review_id="CR-1", is_flagged=True)
 
+    assert captured["method"] == "POST"
     assert captured["body"] == {
-        "projectId": "demo",
         "reviewId": {"projectId": "demo", "reviewId": "CR-1"},
-        "text": "LGTM",
-        "anchor": {},
+        "isFlagged": True,
     }
-    assert result == payload
+    assert isinstance(result, models.CloseReviewResponseDTO)
+    assert result.syncResult is None
 
 
-def test_missing_project_id_raises() -> None:
-    client = make_client(lambda r: httpx.Response(200, json={}), project_id=None)
-    with pytest.raises(UpsourceError):
-        client.get_review("CR-1")
+def test_get_user_agreement_text_typed_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"result": {"text": "hello"}})
+
+    client = make_client(handler)
+    result = client.get_user_agreement_text()
+
+    assert isinstance(result, models.UserAgreementTextDTO)
+    assert result.text == "hello"
 
 
-def test_per_call_project_override() -> None:
+def test_accept_user_agreement_void() -> None:
     captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -265,6 +217,52 @@ def test_per_call_project_override() -> None:
         return httpx.Response(200, json={"result": {}})
 
     client = make_client(handler)
-    client.get_review("CR-1", project_id="other")
+    result = client.accept_user_agreement()
 
-    assert captured["body"]["reviewId"] == {"projectId": "other", "reviewId": "CR-1"}
+    assert result is None
+    assert captured["body"] == {}
+
+
+def test_lenient_response_unknown_enum_and_extra_field() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"result": {"syncResult": "SomeNewValue", "extraField": 42}}
+        )
+
+    client = make_client(handler)
+    result = client.close_review(review_id="CR-1", is_flagged=True)
+
+    # Unknown enum value stays a raw str; extra fields are ignored.
+    assert result.syncResult == "SomeNewValue"
+    assert not hasattr(result, "extraField")
+
+
+def test_strict_request_rejects_wrong_type() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"result": {}})
+
+    client = make_client(handler)
+    with pytest.raises(ValidationError):
+        client.close_review(review_id=123, is_flagged=True)  # type: ignore[arg-type]
+
+
+def test_per_call_project_override() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = json.loads(request.url.params.get("params"))
+        return httpx.Response(200, json={"result": {}})
+
+    client = make_client(handler)
+    try:
+        client.get_review_details(review_id="CR-1", project_id="other")
+    except ValidationError:
+        pass  # empty result does not satisfy ReviewDescriptorDTO
+
+    assert captured["params"] == {"reviewId": {"projectId": "other", "reviewId": "CR-1"}}
+
+
+def test_missing_project_id_raises() -> None:
+    client = make_client(lambda r: httpx.Response(200, json={}), project_id=None)
+    with pytest.raises(UpsourceError):
+        client.get_review_details(review_id="CR-1")
