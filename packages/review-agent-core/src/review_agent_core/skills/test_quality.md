@@ -5,21 +5,19 @@ Base ref: {base_ref}
 Head ref: {head_ref}
 
 Use the tools to gather the diff, changed files, commits, and file contents.
-Open the test files and the code they cover. Then produce a Markdown report
-with exactly these sections:
+Open the test files and the code they cover.
 
-## Test coverage
-Which changed behavior is covered by tests and which is not.
+Report every distinct gap or weak test as a finding: a path, a short stable
+rule title, a summary of what bug it would let through, a concrete suggestion
+(the test to add or the assertion to strengthen), a category (test_gap for
+missing coverage, risk for weak or misleading tests) and a severity:
 
-## Missing scenarios
-Concrete untested cases worth adding: edge cases, error paths, boundary values.
-
-## Weak tests
-Tests that assert too little, are over-mocked, or would not catch the bug they
-claim to guard. For each: file, why it is weak, and how to strengthen it.
+- critical: a security or data-integrity behaviour is untested
+- high: a main code path or error path has no test
+- medium: an edge case or boundary is untested, or a test is too weak
+- low: naming, structure, or redundancy in tests
 
 Rules:
 - Analyze only what the tools actually returned; do not invent code or facts.
-- If the diff is empty, report that there are no changes to review.
-- Cite file paths. Be specific and actionable.
-- Answer in the same language as the code and comments when possible.
+- Prefer concrete scenarios ("empty list", "discount = -1") over generic advice.
+- If the diff is empty, return no findings and say so in a note.

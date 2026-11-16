@@ -24,8 +24,11 @@ review-agent review feature --base develop --tests
 review-agent review feature --code --guide
 ```
 
-Flags are additive: `--code`, `--tests`, `--guide` select modes; `--all` (or no
-flags) runs all three reviewers plus a Review Lead that merges their output.
+Flags are additive: `--code`, `--tests`, `--guide` select modes (each runs its
+own single-agent crew). `--all` (or no flags) runs the full pipeline as one
+Crew: Review Guide → (Code Reviewer ∥ Test Quality Reviewer) → Review Lead,
+where the guide's output is passed to the parallel reviewers and the lead
+merges all three reports.
 `--verbose` additionally turns on CrewAI's full rich console output.
 
 A compact, colorized trace is printed to **stderr**, attributed to the agent

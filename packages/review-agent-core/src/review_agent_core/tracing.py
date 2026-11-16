@@ -72,6 +72,7 @@ _TAG_COLORS = {
     "[llm]": "green",
     "[agent]": "blue",
     "[error]": "bold red",
+    "[note]": "yellow",
     "[usage]": "bold yellow",
 }
 
@@ -168,6 +169,7 @@ class _Counters:
 class _Tracer:
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._print_lock = threading.Lock()
         self._stream: TextIO = sys.stderr
         self._console = Console(file=self._stream, soft_wrap=True)
         self._registered = False
@@ -364,6 +366,10 @@ class _Tracer:
                 f"{c.requests} requests"
             )
 
+    def emit_note(self, message: str, agent: str | None = None) -> None:
+        """Print a diagnostic note line."""
+        self._emit(f"[note] {message}", agent)
+
     def emit_usage_summary(self) -> None:
         """Print the usage summary, plus a per-agent breakdown when useful."""
         self._emit(self.usage_summary())
@@ -385,38 +391,42 @@ class _Tracer:
 
     def _banner(self, title: str, agent: str | None = None) -> None:
         """Print a phase separator line."""
-        color = self._color_for(agent) if agent else "white"
-        try:
-            self._console.print(
-                Text(f"═══ {title} ═══", style=f"bold {color}"), highlight=False
-            )
-        except UnicodeEncodeError:
-            self._write_safe(f"=== {title} ===")
-        except Exception:
-            pass
+        with self._print_lock:
+            color = self._color_for(agent) if agent else "white"
+            try:
+                self._console.print(
+                    Text(f"═══ {title} ═══", style=f"bold {color}"), highlight=False
+                )
+            except UnicodeEncodeError:
+                self._write_safe(f"=== {title} ===")
+            except Exception:
+                pass
 
     def _emit(self, line: str, agent: str | None = None) -> None:
-        try:
-            text = Text()
-            if agent:
-                text.append(f"[{agent}]", style=f"bold {self._color_for(agent)}")
-                text.append(" ")
-            tag = next((t for t in _TAG_COLORS if line.startswith(t)), None)
-            if tag is None:
-                text.append(line)
-            else:
-                text.append(tag, style=_TAG_COLORS[tag])
-                text.append(line[len(tag):])
-        except Exception:
-            return
-        try:
-            self._console.print(text, highlight=False)
-        except UnicodeEncodeError:
-            # A redirected stream may use a legacy encoding (e.g. cp1251) that
-            # cannot represent characters like Σ or …; downgrade to ASCII.
-            self._write_safe(text.plain)
-        except Exception:
-            pass
+        # Pipeline tasks run in parallel, so writes from different agents must
+        # not interleave: hold a dedicated print lock around build + write.
+        with self._print_lock:
+            try:
+                text = Text()
+                if agent:
+                    text.append(f"[{agent}]", style=f"bold {self._color_for(agent)}")
+                    text.append(" ")
+                tag = next((t for t in _TAG_COLORS if line.startswith(t)), None)
+                if tag is None:
+                    text.append(line)
+                else:
+                    text.append(tag, style=_TAG_COLORS[tag])
+                    text.append(line[len(tag):])
+            except Exception:
+                return
+            try:
+                self._console.print(text, highlight=False)
+            except UnicodeEncodeError:
+                # A redirected stream may use a legacy encoding (e.g. cp1251) that
+                # cannot represent characters like Σ or …; downgrade to ASCII.
+                self._write_safe(text.plain)
+            except Exception:
+                pass
 
     def _write_safe(self, plain: str) -> None:
         """Write ``plain`` with characters unrepresentable in the stream dropped."""
@@ -450,3 +460,8 @@ def usage_summary() -> str:
 def print_usage_summary() -> None:
     """Print the usage summary (and per-agent breakdown) to the trace stream."""
     _tracer.emit_usage_summary()
+
+
+def trace_note(message: str, agent: str | None = None) -> None:
+    """Print a diagnostic note line to the trace stream."""
+    _tracer.emit_note(message, agent)
