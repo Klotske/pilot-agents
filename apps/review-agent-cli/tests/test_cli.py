@@ -22,3 +22,15 @@ def test_parser_mode_flags() -> None:
 def test_parser_all_flag() -> None:
     args = build_parser().parse_args(["review", "--all", "--code"])
     assert args.all and args.code
+
+
+def test_parser_compaction_flags() -> None:
+    args = build_parser().parse_args(["review"])
+    assert args.context_window is None
+    assert not args.no_compact
+
+    args = build_parser().parse_args(
+        ["review", "--context-window", "131072", "--no-compact"]
+    )
+    assert args.context_window == 131_072
+    assert args.no_compact

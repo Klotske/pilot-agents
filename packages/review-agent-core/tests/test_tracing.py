@@ -79,3 +79,29 @@ def test_emit_survives_legacy_encoding() -> None:
     written = raw.getvalue().decode("cp1251")
     assert "[Code Reviewer]" in written
     assert "5(tok) running" in written
+
+
+def test_context_budget_formats_percent_and_markers() -> None:
+    from review_agent_core.tracing import ContextBudget
+
+    budget = ContextBudget.from_window(6_000, 0.75, 0.5)
+    assert (budget.trigger, budget.target) == (4_500, 3_000)
+    assert budget.percent(1_200) == "20%"
+    assert budget.marker(1_200) == ""
+    assert budget.marker(4_500).strip() == "⚠trigger"
+    assert budget.marker(5_100).strip() == "⚠crewai"
+    assert budget.marker(6_000).strip() == "⚠window"
+    assert budget.marker(7_128).strip() == "⚠window"
+
+    # A 1M window must not turn into "1000%"-style noise on sub-percent values.
+    big = ContextBudget.from_window(1_000_000, 0.75, 0.5)
+    assert big.percent(4_982) == "0.5%"
+    assert big.marker(4_982) == ""
+
+
+def test_budget_from_ratios() -> None:
+    from review_agent_core.tracing import ContextBudget
+
+    assert ContextBudget.from_window(6_000, 0.6, 0.4) == ContextBudget(6_000, 3_600, 2_400)
+    # A degenerate window must not raise from a trace-formatting helper.
+    assert ContextBudget(0, 0, 0).percent(10) == "?"

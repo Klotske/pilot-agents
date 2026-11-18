@@ -121,3 +121,151 @@ def test_trace_lines_for_agent_llm_tool_and_error() -> None:
 
     # agent completion with duration (3)
     assert re.search(r"\[agent\] done in \d+\.\d+s", joined), joined
+
+
+def _llm_events(agent, prompt: int) -> tuple[LLMCallStartedEvent, LLMCallCompletedEvent]:
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    return (
+        LLMCallStartedEvent(
+            call_id=f"c-{agent.role}-{prompt}",
+            model="deepseek-flash",
+            from_agent=agent,
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{"type": "function"}],
+        ),
+        LLMCallCompletedEvent(
+            call_id=f"c-{agent.role}-{prompt}",
+            model="deepseek-flash",
+            response="ok",
+            call_type=LLMCallType.LLM_CALL,
+            usage={"prompt_tokens": prompt, "completion_tokens": 10, "total_tokens": prompt + 10},
+            finish_reason="stop",
+            from_agent=agent,
+            timestamp=now,
+        ),
+    )
+
+
+def test_context_window_is_reported_per_call() -> None:
+    from typing import Any
+
+    from review_agent_core.tracing import ContextBudget
+
+    buffer = io.StringIO()
+    tracer = _Tracer()
+    tracer.enable(stream=buffer)
+    tracer.set_budget(ContextBudget.from_window(6_000, 0.75, 0.5))
+
+    agent = Agent(
+        role="Code Reviewer",
+        goal="g",
+        backstory="b",
+        tools=[],
+        llm=build_llm(LLMConfig(model="openai/gpt-4o-mini")),
+    )
+    for prompt in (1_200, 5_200):
+        started, completed = _llm_events(agent, prompt)
+        _emit(started)
+        _emit(completed)
+
+    out = buffer.getvalue()
+    assert "ctx 1200/6000 20%" in out
+    assert "ctx 5200/6000 87% ⚠crewai" in out
+    # The next request announces the previous actual, for estimate calibration.
+    assert "last actual 1200(tok)" in out
+
+    summary = tracer.usage_summary()
+    assert "peak ctx 5200/6000 87% ⚠crewai" in summary
+
+
+def test_agentless_calls_are_labelled_direct() -> None:
+    buffer = io.StringIO()
+    tracer = _Tracer()
+    tracer.enable(stream=buffer)
+
+    started = LLMCallStartedEvent(
+        call_id="c-direct",
+        model="deepseek-flash",
+        from_agent=None,
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+    )
+    completed = LLMCallCompletedEvent(
+        call_id="c-direct",
+        model="deepseek-flash",
+        response="ok",
+        call_type=LLMCallType.LLM_CALL,
+        usage={"prompt_tokens": 300, "completion_tokens": 20, "total_tokens": 320},
+        finish_reason="stop",
+        from_agent=None,
+        timestamp=started.timestamp,
+    )
+    _emit(started)
+    _emit(completed)
+
+    out = buffer.getvalue()
+    assert "[direct] [llm]" in out
+    assert "unknown agent" not in out
+
+
+def test_forced_final_answer_is_labelled_separately_from_schema_conversion() -> None:
+    """A `max_iter` recovery resumes the agent history; a schema conversion does not."""
+    buffer = io.StringIO()
+    tracer = _Tracer()
+    tracer.enable(stream=buffer)
+
+    def emit_call(call_id: str, messages: list[dict[str, Any]], prompt: int) -> None:
+        started = LLMCallStartedEvent(
+            call_id=call_id,
+            model="deepseek-flash",
+            from_agent=None,
+            messages=messages,
+            tools=None,
+        )
+        _emit(started)
+        _emit(
+            LLMCallCompletedEvent(
+                call_id=call_id,
+                model="deepseek-flash",
+                response="ok",
+                call_type=LLMCallType.LLM_CALL,
+                usage={"prompt_tokens": prompt, "completion_tokens": 10, "total_tokens": prompt + 10},
+                finish_reason="stop",
+                from_agent=None,
+                timestamp=started.timestamp,
+            )
+        )
+
+    emit_call(
+        "schema",
+        [{"role": "system", "content": "convert"}, {"role": "user", "content": "answer"}],
+        300,
+    )
+    emit_call(
+        "recovery",
+        [
+            {"role": "system", "content": "task"},
+            {"role": "user", "content": "reports"},
+            {"role": "assistant", "content": None},
+            {"role": "tool", "tool_call_id": "1", "name": "list_files", "content": "a\nb"},
+            {"role": "user", "content": "give the final answer"},
+        ],
+        700,
+    )
+
+    out = buffer.getvalue()
+    assert "[direct] [llm]" in out
+    assert "[direct/recovery] [llm]" in out
+
+
+def test_direct_usage_is_reported_by_label() -> None:
+    from review_agent_core.tracing import _direct_label
+
+    assert _direct_label([{"role": "user", "content": "x"}]) == "direct"
+    assert _direct_label("a prompt") == "direct"
+    assert (
+        _direct_label([{"role": "tool", "tool_call_id": "1", "content": "x"}])
+        == "direct/recovery"
+    )

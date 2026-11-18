@@ -21,6 +21,7 @@ import logging
 import sys
 import threading
 import zlib
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, TextIO, cast
 
@@ -49,6 +50,55 @@ MAX_ARGS_CHARS = 200
 MAX_OUTPUT_HEAD = 120
 MAX_ERROR_CHARS = 300
 
+# Label for LLM calls made without an agent (CrewAI's structured-output
+# conversion, internal analysis): they cost real tokens and must be visible.
+# Labels for LLM calls made without an agent. CrewAI uses direct calls for two
+# very different jobs, and they cost very different amounts:
+#   * ``direct`` -- converting an answer into the ``output_pydantic`` schema;
+#   * ``direct/recovery`` -- a forced final answer after ``max_iter`` was used up,
+#     which continues the agent's own history (it contains ``tool`` messages).
+# Keeping them apart makes a run readable without reconstructing it from msgs=N.
+DIRECT_AGENT = "direct"
+DIRECT_RECOVERY = "direct/recovery"
+
+# CrewAI summarizes a request on its own once it reaches 85% of the window.
+CREWAI_PREFLIGHT_RATIO = 0.85
+
+
+@dataclass(frozen=True)
+class ContextBudget:
+    """The window a run was budgeted against, for the per-call ``ctx`` stats."""
+
+    window: int
+    trigger: int
+    target: int
+
+    @classmethod
+    def from_window(cls, window: int, trigger_ratio: float, target_ratio: float) -> ContextBudget:
+        """Build a budget from a raw model window and the compaction ratios."""
+        return cls(
+            window=window,
+            trigger=int(window * trigger_ratio),
+            target=int(window * target_ratio),
+        )
+
+    def percent(self, tokens: int) -> str:
+        """Format ``tokens`` as a share of the window (``83%``, ``0.5%``)."""
+        if self.window <= 0:
+            return "?"
+        percent = 100 * tokens / self.window
+        return f"{percent:.1f}%" if percent < 10 else f"{percent:.0f}%"
+
+    def marker(self, tokens: int) -> str:
+        """Return the warning marker for a request of ``tokens`` input tokens."""
+        if tokens >= self.window:
+            return " ⚠window"
+        if tokens >= self.window * CREWAI_PREFLIGHT_RATIO:
+            return " ⚠crewai"
+        if tokens >= self.trigger:
+            return " ⚠trigger"
+        return ""
+
 # Distinguishable rich colors; an agent's name is hashed to pick one.
 _AGENT_PALETTE = (
     "bright_cyan",
@@ -73,6 +123,7 @@ _TAG_COLORS = {
     "[agent]": "blue",
     "[error]": "bold red",
     "[note]": "yellow",
+    "[compact]": "bold magenta",
     "[usage]": "bold yellow",
 }
 
@@ -138,6 +189,23 @@ def _elapsed(start: datetime | None, end: datetime | None) -> str | None:
         return None
 
 
+def _direct_label(messages: Any) -> str:
+    """Label an agent-less LLM call by what it is actually doing.
+
+    CrewAI's ``output_pydantic`` conversion sends exactly two messages (an
+    instruction and the answer). A forced final answer after ``max_iter`` resumes
+    the agent's own history, which by definition contains ``tool`` messages.
+    """
+    if isinstance(messages, list):
+        for message in cast("list[Any]", messages):
+            if not isinstance(message, dict):
+                continue
+            entry = cast("dict[str, Any]", message)
+            if entry.get("role") == "tool":
+                return DIRECT_RECOVERY
+    return DIRECT_AGENT
+
+
 def _messages_summary(messages: Any) -> str:
     """Describe an LLM request's messages by count and total character size."""
     if messages is None:
@@ -179,6 +247,10 @@ class _Tracer:
         self._colors: dict[str, str] = {}         # agent -> assigned color
         self._llm_started: dict[str, datetime] = {}     # call_id -> started at
         self._agent_started: dict[str, datetime] = {}   # agent_role -> started at
+        self._budget: ContextBudget | None = None
+        self._last_prompt: dict[str, int] = {}          # agent -> last prompt tokens
+        self._peak_prompt: dict[str, int] = {}          # agent -> peak prompt tokens
+        self._call_label: dict[str, str] = {}           # call_id -> trace label
 
     # ------------------------------------------------------------------ colors
 
@@ -234,9 +306,12 @@ class _Tracer:
 
         @crewai_event_bus.on(LLMCallStartedEvent)
         def _on_llm_started(_source: object, event: LLMCallStartedEvent) -> None:
+            agent = event.agent_role or _direct_label(event.messages)
             if event.call_id:
                 with self._lock:
                     self._llm_started[event.call_id] = event.timestamp
+                    if event.agent_role is None:
+                        self._call_label[event.call_id] = agent
             details: list[str] = [_messages_summary(event.messages)]
             if event.tools:
                 details.append(f"tools={len(event.tools)}")
@@ -246,8 +321,14 @@ class _Tracer:
             ):
                 if value is not None:
                     details.append(f"{label}={value}")
+            with self._lock:
+                last = self._last_prompt.get(agent)
+            if last is not None:
+                # Calibration for the compaction estimate: it counts message
+                # content only, the provider also bills the tool schemas.
+                details.append(f"last actual {last}(tok)")
             model = event.model or "llm"
-            self._emit(f"[llm] {model} request: {', '.join(details)}", event.agent_role)
+            self._emit(f"[llm] {model} request: {', '.join(details)}", agent)
 
         @crewai_event_bus.on(LLMCallCompletedEvent)
         def _on_llm_completed(_source: object, event: LLMCallCompletedEvent) -> None:
@@ -255,7 +336,10 @@ class _Tracer:
             prompt = int(usage.get("prompt_tokens", 0))
             completion = int(usage.get("completion_tokens", 0))
             total = int(usage.get("total_tokens", prompt + completion))
-            agent = event.agent_role or "unknown agent"
+            agent = event.agent_role or DIRECT_AGENT
+            if event.agent_role is None:
+                with self._lock:
+                    agent = self._call_label.pop(event.call_id, DIRECT_AGENT)
             with self._lock:
                 self._live.prompt_tokens += prompt
                 self._live.completion_tokens += completion
@@ -267,9 +351,17 @@ class _Tracer:
                 per_agent.completion_tokens += completion
                 per_agent.total_tokens += total
                 per_agent.requests += 1
+                self._last_prompt[agent] = prompt
+                self._peak_prompt[agent] = max(self._peak_prompt.get(agent, 0), prompt)
                 started = self._llm_started.pop(event.call_id, None)
+                budget = self._budget
             model = event.model or "llm"
             extras: list[str] = []
+            if budget is not None:
+                extras.append(
+                    f"ctx {prompt}/{budget.window} {budget.percent(prompt)}"
+                    f"{budget.marker(prompt)}"
+                )
             if event.finish_reason:
                 extras.append(f"finish={event.finish_reason}")
             call_type = getattr(event, "call_type", None)
@@ -282,17 +374,18 @@ class _Tracer:
             self._emit(
                 f"[llm] {model} {prompt}(tok) prompt + {completion}(tok) completion"
                 f" = {total}(tok) this step | Σ {running}(tok) running{suffix}",
-                event.agent_role,
+                agent,
             )
 
         @crewai_event_bus.on(LLMCallFailedEvent)
         def _on_llm_failed(_source: object, event: LLMCallFailedEvent) -> None:
             with self._lock:
                 self._llm_started.pop(event.call_id, None)
+                label = self._call_label.pop(event.call_id, None)
             model = event.model or "llm"
             self._emit(
                 f"[error] {model} call failed: {_head(event.error, MAX_ERROR_CHARS)}",
-                event.agent_role,
+                event.agent_role or label,
             )
 
         # ---------------------------------------------------------- tools (1)
@@ -347,8 +440,25 @@ class _Tracer:
 
     # ------------------------------------------------------------------- usage
 
+    def set_budget(self, budget: ContextBudget | None) -> None:
+        """Budget the run's requests against, and reset the per-run peaks."""
+        with self._lock:
+            self._budget = budget
+            self._last_prompt.clear()
+            self._peak_prompt.clear()
+
+    def last_prompt_tokens(self, agent: str) -> int | None:
+        """Input tokens of ``agent``'s most recent request, when known."""
+        with self._lock:
+            return self._last_prompt.get(agent)
+
     def record_usage(self, metrics: UsageMetrics | None) -> None:
-        """Accumulate authoritative usage from a finished crew."""
+        """Cross-check CrewAI's crew rollup against the per-call events.
+
+        The rollup is not authoritative: on a multi-task pipeline it reports the
+        same calls once per task (seen as exactly xN). The event counters are
+        exact, so the rollup is only compared against them.
+        """
         if metrics is None:
             return
         with self._lock:
@@ -356,35 +466,70 @@ class _Tracer:
             self._final.completion_tokens += metrics.completion_tokens
             self._final.total_tokens += metrics.total_tokens
             self._final.requests += metrics.successful_requests
+            live_total = self._live.total_tokens
+            live_requests = self._live.requests
+        if not live_total or not metrics.total_tokens:
+            return
+        drift = abs(metrics.total_tokens - live_total) / live_total
+        if drift <= 0.05:
+            return
+        self._emit(
+            f"[usage] note: crewai rolled up {metrics.total_tokens} tok / "
+            f"{metrics.successful_requests} requests, events say {live_total} / "
+            f"{live_requests} — using the event counts"
+        )
 
     def usage_summary(self) -> str:
         with self._lock:
-            c = self._final if self._final.requests else self._live
-            return (
-                f"[usage] {c.total_tokens} tokens "
-                f"({c.prompt_tokens} prompt + {c.completion_tokens} completion), "
-                f"{c.requests} requests"
+            # Event counters are exact; the rollup is only a fallback for runs
+            # where tracing was never enabled and no events were recorded.
+            c = self._live if self._live.requests else self._final
+            budget = self._budget
+            peak = max(self._peak_prompt.values(), default=0)
+        summary = (
+            f"[usage] {c.total_tokens} tokens "
+            f"({c.prompt_tokens} prompt + {c.completion_tokens} completion), "
+            f"{c.requests} requests"
+        )
+        if budget is not None and peak:
+            summary += (
+                f", peak ctx {peak}/{budget.window} {budget.percent(peak)}"
+                f"{budget.marker(peak)}"
             )
+        return summary
 
     def emit_note(self, message: str, agent: str | None = None) -> None:
-        """Print a diagnostic note line."""
-        self._emit(f"[note] {message}", agent)
+        """Print a diagnostic note line.
+
+        A message that already starts with a known tag (``[compact]``, ...) is
+        printed as is, so notes can carry their own category.
+        """
+        tagged = any(message.startswith(tag) for tag in _TAG_COLORS)
+        self._emit(message if tagged else f"[note] {message}", agent)
 
     def emit_usage_summary(self) -> None:
         """Print the usage summary, plus a per-agent breakdown when useful."""
         self._emit(self.usage_summary())
         with self._lock:
             breakdown = [
-                (agent, c.total_tokens, c.requests)
+                (agent, c.total_tokens, c.requests, self._peak_prompt.get(agent, 0))
                 for agent, c in self._per_agent.items()
             ]
+            budget = self._budget
         if len(breakdown) < 2:
             return
-        for agent, tokens, requests in sorted(
+        for agent, tokens, requests, peak in sorted(
             breakdown, key=lambda item: item[1], reverse=True
         ):
+            peak_note = ""
+            if budget is not None and peak:
+                peak_note = (
+                    f", peak ctx {peak}/{budget.window} {budget.percent(peak)}"
+                    f"{budget.marker(peak)}"
+                )
             self._emit(
-                f"[usage] {agent}: {tokens} tokens, {requests} requests", agent=agent
+                f"[usage] {agent}: {tokens} tokens, {requests} requests{peak_note}",
+                agent=agent,
             )
 
     # ------------------------------------------------------------------ output
@@ -447,13 +592,23 @@ def enable_tracing(stream: TextIO | None = None) -> None:
     _tracer.enable(stream)
 
 
+def set_context_budget(budget: ContextBudget | None) -> None:
+    """Set the window a run is budgeted against and reset its peaks."""
+    _tracer.set_budget(budget)
+
+
+def last_prompt_tokens(agent: str) -> int | None:
+    """Input tokens of ``agent``'s most recent request, when tracing saw it."""
+    return _tracer.last_prompt_tokens(agent)
+
+
 def record_usage(metrics: UsageMetrics | None) -> None:
-    """Accumulate authoritative usage from a finished crew (for the summary)."""
+    """Cross-check a finished crew's rollup against the per-call events."""
     _tracer.record_usage(metrics)
 
 
 def usage_summary() -> str:
-    """Return a one-line token usage summary."""
+    """Return a one-line token and context-window usage summary."""
     return _tracer.usage_summary()
 
 
