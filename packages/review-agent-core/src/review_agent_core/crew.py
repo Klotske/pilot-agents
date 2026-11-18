@@ -28,8 +28,22 @@ from .schemas import MergedReport, ReviewerFindings
 from .tools.git_tools import make_git_tools
 
 REPORT_OUTPUT = "A concise Markdown report following the sections in the instructions."
-FINDINGS_OUTPUT = "Structured findings for every distinct problem."
-MERGED_OUTPUT = "A consolidated, deduplicated report ordered by severity."
+FINDINGS_OUTPUT = (
+    "One JSON object matching the schema above: findings plus notes, no prose."
+)
+MERGED_OUTPUT = (
+    "One JSON object matching the schema above: summary, findings, remaining_notes, "
+    "no prose."
+)
+
+# The lead merges reports that already contain the diff and the file contents, so
+# it must not fetch anything: a tool round is a chance to end the task without a
+# final answer, which then costs an LLM schema conversion plus a task retry. One
+# cheap tool stays attached for protocol reasons (CrewAI only skips the
+# provider-level response_format request when an agent has a tool), and the skill
+# tells the model not to call it.
+LEAD_TOOLS: frozenset[str] = frozenset({"list_files"})
+LEAD_MAX_ITER = 2
 
 # Structured output goes through ``Task.output_pydantic``, which makes CrewAI
 # append the pydantic schema to the prompt and validate the answer afterwards.
@@ -47,13 +61,33 @@ def load_skill(name: str) -> str:
     return files("review_agent_core").joinpath("skills", f"{name}.md").read_text(encoding="utf-8")
 
 
+# The provider is pinned instead of letting CrewAI parse the model string.
+# A gateway id is ``vendor/model`` (``deepseek/deepseek-v4.1-flash``), and
+# CrewAI's ``LLM.__new__`` reads that leading segment as a provider route: for
+# ``deepseek/...`` it strips the prefix before sending and the gateway answers
+# 404 ``model_not_found``; for ``anthropic/...`` or ``google/...`` it tries to
+# import a native provider that is not a dependency here; for anything else it
+# wants the LiteLLM fallback, which is not installed either. An explicit
+# provider skips that resolution entirely (``model_string = model`` in
+# ``LLM._resolve_route``), so the id goes on the wire exactly as the gateway
+# lists it in ``/models``.
+PROVIDER = "openai"
+
+
 def build_llm(cfg: LLMConfig) -> LLM:
-    """Build a CrewAI ``LLM`` for an OpenAI-compatible endpoint."""
+    """Build a CrewAI ``LLM`` for an OpenAI-compatible endpoint.
+
+    ``context_window_size`` is forwarded when known: CrewAI otherwise guesses a
+    window from its model catalog (4096 tokens for an unknown gateway alias),
+    which misleads both its own handling and ours.
+    """
     return LLM(
         model=cfg.model,
+        provider=PROVIDER,
         base_url=cfg.base_url,
         api_key=cfg.api_key,
         temperature=cfg.temperature,
+        context_window_size=cfg.context_window_size,
     )
 
 
@@ -114,7 +148,9 @@ def _make_agent(
     tools: list[BaseTool],
     *,
     verbose: bool = False,
+    max_iter: int | None = None,
 ) -> Agent:
+    extra = {} if max_iter is None else {"max_iter": max_iter}
     return Agent(
         role=spec.role,
         goal=spec.goal,
@@ -122,6 +158,13 @@ def _make_agent(
         tools=tools,
         llm=llm,
         verbose=verbose,
+        # Proactive compaction (``compaction.Compactor``) keeps the history under
+        # the window. The built-in path only fires on a provider error and then
+        # replaces *all* non-system messages with one summary -- which drops the
+        # task prompt and the output schema. It stays enabled purely as a
+        # last-resort net for a mis-estimated window; it never runs otherwise.
+        respect_context_window=True,
+        **extra,
     )
 
 
@@ -219,11 +262,15 @@ def build_review_pipeline_crew(
     tests_agent = _make_agent(
         TEST_QUALITY_REVIEWER, llm, make_git_tools(repo, scope), verbose=verbose
     )
-    # The lead gets the git tools so structured output stays on the tool-present
-    # path (see the note next to REPORT_OUTPUT). It uses them only to verify a
-    # finding it is about to merge.
+    # The lead gets only the lookup pair so it cannot spend its rounds re-reading
+    # what the attached reports already contain, and a hard cap on iterations so
+    # a failed round cannot cascade into a conversion plus a task retry.
     lead_agent = _make_agent(
-        REVIEW_LEAD, llm, make_git_tools(repo, scope), verbose=verbose
+        REVIEW_LEAD,
+        llm,
+        make_git_tools(repo, scope, only=LEAD_TOOLS),
+        verbose=verbose,
+        max_iter=LEAD_MAX_ITER,
     )
 
     guide_task = _make_task(REVIEW_GUIDE, guide_agent)

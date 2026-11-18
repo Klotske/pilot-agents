@@ -84,3 +84,68 @@ def test_branch_diff_over_fixture(tmp_path: Path) -> None:
     assert "calculator.py" in repo.changed_files(scope)
     assert "raise ValueError" in repo.diff(scope)
     assert "guard division by zero" in repo.log(scope)
+
+
+def test_resolve_ref_falls_back_to_the_remote_branch(tmp_path: Path) -> None:
+    repo_path = init_repo(tmp_path / "repo")
+    write(repo_path, "a.txt", "x\n")
+    commit_all(repo_path, "init")
+    git(repo_path, "branch", "feature")
+    git(repo_path, "update-ref", "refs/remotes/origin/feature", "feature")
+    git(repo_path, "branch", "-D", "feature")
+
+    repo = GitRepo(repo_path)
+
+    # A fresh clone knows the branch only as origin/<name>.
+    assert repo.resolve_ref("feature") == "origin/feature"
+    assert repo.resolve_ref("main") == "main"
+    assert repo.resolve_ref("HEAD") == "HEAD"
+
+
+def test_resolve_ref_error_lists_available_refs(tmp_path: Path) -> None:
+    repo_path = init_repo(tmp_path / "repo")
+    write(repo_path, "a.txt", "x\n")
+    commit_all(repo_path, "init")
+
+    with pytest.raises(GitError, match="available refs"):
+        GitRepo(repo_path).resolve_ref("nope")
+
+
+def test_read_file_rejects_a_directory(tmp_path: Path) -> None:
+    repo_path = init_repo(tmp_path / "repo")
+    write(repo_path, "src/app.py", "x = 1\n")
+    commit_all(repo_path, "init")
+
+    repo = GitRepo(repo_path)
+
+    for path in (".", "", "src", "src/"):
+        with pytest.raises(GitError, match="is a directory"):
+            repo.read_file(path, "HEAD")
+
+
+def test_list_files_lists_the_tree_at_a_ref(tmp_path: Path) -> None:
+    repo_path = init_repo(tmp_path / "repo")
+    write(repo_path, "app.py", "x = 1\n")
+    write(repo_path, "tests/test_app.py", "def test_x(): pass\n")
+    write(repo_path, "docs/readme.md", "# docs\n")
+    commit_all(repo_path, "init")
+
+    repo = GitRepo(repo_path)
+
+    assert repo.list_files("HEAD") == ["app.py", "docs/readme.md", "tests/test_app.py"]
+    assert repo.list_files("HEAD", "tests") == ["tests/test_app.py"]
+    assert repo.list_files("HEAD", "tests/") == ["tests/test_app.py"]
+    assert repo.list_files("HEAD", "missing") == []
+
+
+def test_read_file_error_points_at_list_files(tmp_path: Path) -> None:
+    repo_path = init_repo(tmp_path / "repo")
+    write(repo_path, "app.py", "x = 1\n")
+    commit_all(repo_path, "init")
+
+    repo = GitRepo(repo_path)
+
+    with pytest.raises(GitError, match="list_files"):
+        repo.read_file("missing.py", "main")
+    with pytest.raises(GitError, match="available refs"):
+        repo.read_file("app.py", "nope")

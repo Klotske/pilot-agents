@@ -13,3 +13,7 @@ wheels/
 .env
 .env.*
 !.env.example
+
+# Review run logs and gateway model dumps (scratch output)
+*.log
+models.json

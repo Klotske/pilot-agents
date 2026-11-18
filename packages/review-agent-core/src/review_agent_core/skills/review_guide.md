@@ -5,6 +5,11 @@ Base ref: {base_ref}
 Head ref: {head_ref}
 
 Use the tools to gather the diff, changed files, commits, and file contents.
+Start with get_changed_files (or get_diff_stat): do not guess paths. read_file
+takes one file and refuses a directory -- use list_files(ref, path) to see what
+exists at a ref. If a tool reports a missing ref or path, do not retry with
+invented variants; use get_changed_files/get_diff_stat/list_files to see what is
+actually there.
 Read files at {head_ref} for the new version and at {base_ref} for the old one.
 Then produce a Markdown guide with exactly these sections:
 
